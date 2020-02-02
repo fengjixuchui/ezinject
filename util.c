@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 #include "util.h"
+#include <stdbool.h>
+#include <string.h>
 #include <sys/uio.h>
 #include <ctype.h>
+#include "ezinject.h"
 
 void hexdump(void *pAddressIn, long lSize) {
 	char szBuf[100];
@@ -55,6 +58,7 @@ void *get_base(pid_t pid, char *libname)
 	char line[256];
 	char path[128];
 	void *base;
+	char perms[8];
 	bool found = false;
 	snprintf(line, 256, "/proc/%u/maps", pid);
 	FILE *fp = fopen(line, "r");
@@ -64,12 +68,57 @@ void *get_base(pid_t pid, char *libname)
 		if(!fgets(line, 256, fp))
 			break;
 		strcpy(path, "[anonymous]");
-		val = sscanf(line, "%p-%*p %*s %*p %*x:%*x %*u %s", &base, path);
-		if(!libname || strstr(path, libname))
+		val = sscanf(line, "%p-%*p %s %*p %*x:%*x %*u %s", &base, (char *)&perms, path);
+		
+		if(strstr(path, libname) && strchr(perms, 'x') != NULL){
 			found = true;
+		}
 	} while(val > 0 && !found);
 	fclose(fp);
-	return base;
+
+	return (found) ? base : NULL;
+}
+
+FILE *mem_open(pid_t pid){
+	char line[256];
+	snprintf(line, sizeof(line), "/proc/%u/mem", pid);
+	return fopen(line, "rb+");
+}
+
+uintptr_t get_code_base(pid_t pid){
+	char line[256];
+
+	snprintf(line, sizeof(line), "/proc/%u/maps", pid);
+	FILE *fp = fopen(line, "r");
+	if(fp == NULL){
+		PERROR("fopen maps");
+		return 0;
+	}
+
+	uintptr_t start, end;
+	char perms[8];
+	memset(perms, 0x00, sizeof(perms));
+
+	int val;
+	uintptr_t region_addr = 0;
+
+	while(region_addr == 0){
+		if(!fgets(line, sizeof(line), fp)){
+			PERROR("fgets");
+			break;			
+		}
+		val = sscanf(line, "%p-%p %s %*p %*x:%*x %*u %*s", (void **)&start, (void **)&end, (char *)&perms);
+		if(val == 0){
+			break;
+		}
+
+		if(strchr(perms, 'x') != NULL){
+			region_addr = start;
+		}
+	}
+
+	fclose(fp);
+	return region_addr;
 }
 
 #if 0
