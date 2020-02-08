@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <string.h>
 #include <signal.h>
 #include <stdint.h>
@@ -17,11 +18,10 @@
 #include <sys/wait.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
-#include <sys/user.h>
 
 #include "config.h"
 
-#ifdef EZ_ARCH_MIPS
+#ifndef HAVE_SHM_SYSCALLS
 #include <asm-generic/ipc.h>
 #endif
 
@@ -44,62 +44,46 @@ static ez_region region_sc_insn = {
 	.end = (void *)&injected_sc_end
 };
 
-void setregs_callstack(
-	struct user *orig_ctx,
-	struct user *new_ctx,
-	void *pUserData
-){
-	UNUSED(orig_ctx);
-
-	struct call_req *call = (struct call_req *)pUserData;
-	struct callstack_req cs = call->u.call;
-
-	REG(*new_ctx, REG_PC) = call->insn_addr;
-	REG(*new_ctx, REG_SP) = cs.stack_addr;
-}
-
 void setregs_syscall(
-	struct user *orig_ctx,
-	struct user *new_ctx,
-	void *pUserData
+	regs_t *orig_ctx,
+	regs_t *new_ctx,
+	struct call_req call
 ){
-	struct call_req *call = (struct call_req *)pUserData;
-	struct sc_req sc = call->u.syscall;
+	struct sc_req sc = call.syscall;
 
-	REG(*new_ctx, REG_PC) = call->insn_addr;
-	REG(*new_ctx, REG_NR) = sc.nr;
-	REG(*new_ctx, REG_ARG1) = sc.arg1;
-	REG(*new_ctx, REG_ARG2) = sc.arg2;
-	REG(*new_ctx, REG_ARG3) = sc.arg3;
+	REG(*new_ctx, REG_PC) = call.insn_addr;
 
-#ifdef EZ_ARCH_MIPS
-	REG(*new_ctx, REG_ARG4) = sc.arg4;
-#else
-	REG(*new_ctx, REG_ARG4) = 0;
-	REG(*new_ctx, REG_ARG5) = 0;
-#endif
+	if(SC_HAS_ARG(sc, 0)){
+		REG(*new_ctx, REG_NR)   = sc.argv[0];
+		REG(*new_ctx, REG_ARG1) = sc.argv[1];
+		REG(*new_ctx, REG_ARG2) = sc.argv[2];
+		REG(*new_ctx, REG_ARG3) = sc.argv[3];
+		REG(*new_ctx, REG_ARG4) = sc.argv[4];
+
+		DBG("remote_call(%u)", (unsigned int)sc.argv[0]);
+	}
+
+	if(call.stack_addr != 0){
+		REG(*new_ctx, REG_SP) = call.stack_addr;
+	}
 
 #ifdef EZ_ARCH_I386
 	//ebp must point to valid stack
 	REG(*new_ctx, REG_ARG6) = REG(*orig_ctx, REG_SP);
 #else
 	UNUSED(orig_ctx);
-#ifndef EZ_ARCH_MIPS
-	REG(*new_ctx, REG_ARG6) = 0;
-#endif
 #endif
 
-	DBG("remote_call(%u)", (unsigned int)sc.nr);
 }
 
-uintptr_t remote_call_common(pid_t target, pfnRegSet setRegs, void *pUserData){
-	struct user orig_ctx, new_ctx;
+uintptr_t remote_call_common(pid_t target, struct call_req call){
+	regs_t orig_ctx, new_ctx;
 	memset(&orig_ctx, 0x00, sizeof(orig_ctx));
 
 	ptrace(PTRACE_GETREGS, target, 0, &orig_ctx);
 	memcpy(&new_ctx, &orig_ctx, sizeof(orig_ctx));
 
-	setRegs(&orig_ctx, &new_ctx, pUserData);
+	setregs_syscall(&orig_ctx, &new_ctx, call);
 
 	ptrace(PTRACE_SETREGS, target, 0, &new_ctx);
 
@@ -116,45 +100,36 @@ uintptr_t remote_call_common(pid_t target, pfnRegSet setRegs, void *pUserData){
 	ptrace(PTRACE_SETREGS, target, 0, &orig_ctx);
 	DBG("[RET] = %zu", (uintptr_t)REG(new_ctx, REG_RET));
 
-	struct call_req *call = (struct call_req *)pUserData;
 	DBG("PC: %p => %p",
-		(void *)call->insn_addr,
-		(void *)REG(new_ctx, REG_PC));
+		(void *)call.insn_addr,
+		(void *)((uintptr_t)REG(new_ctx, REG_PC)));
 
 	return REG(new_ctx, REG_RET);
 }
 
-uintptr_t remote_call_stack(
-	pid_t target,
-	uintptr_t insn_addr,
-	uintptr_t stack_addr
-){
-	struct call_req req = {
-		.insn_addr = insn_addr,
-		.u.call = {
-			.stack_addr = stack_addr
-		}
-	};
-	return remote_call_common(target, &setregs_callstack, &req);
-}
-
 uintptr_t remote_call(
 	pid_t target,
-	uintptr_t insn_addr, int nr,
-	uintptr_t arg1, uintptr_t arg2, uintptr_t arg3,
-	uintptr_t arg4
+	uintptr_t stack_addr,
+	uintptr_t insn_addr,
+	unsigned int argmask, ...
 ){
 	struct call_req req = {
 		.insn_addr = insn_addr,
-		.u.syscall = {
-			.nr = nr,
-			.arg1 = arg1,
-			.arg2 = arg2,
-			.arg3 = arg3,
-			.arg4 = arg4
-		}
+		.stack_addr = stack_addr
 	};
-	return remote_call_common(target, &setregs_syscall, &req);
+
+	va_list ap;
+	va_start(ap, argmask);
+
+	struct sc_req sc;
+	sc.argmask = argmask;
+
+	for(int i=0; i<SC_MAX_ARGS; i++){
+		sc.argv[i] = (SC_HAS_ARG(sc, i)) ? va_arg(ap, uintptr_t) : 0;
+	}
+	req.syscall = sc;
+
+	return remote_call_common(target, req);
 }
 
 struct ezinj_str ezstr_new(char *str){
@@ -175,13 +150,10 @@ ez_addr sym_addr(void *handle, const char *sym_name, ez_addr lib){
 }
 
 int libc_init(struct ezinj_ctx *ctx){	
-	/**
-	 * locate glibc in /proc/<pid>/maps
-	 * both for local and remote procs
-	 */
+	char *ignores[] = {"ld-", NULL};
 	ez_addr libc = {
-		.local  = (uintptr_t) get_base(getpid(), "libc-"),
-		.remote = (uintptr_t) get_base(ctx->target, "libc-")
+		.local  = (uintptr_t) get_base(getpid(), "libc", ignores),
+		.remote = (uintptr_t) get_base(ctx->target, "libc", ignores)
 	};
 	
 	DBGPTR(libc.remote);
@@ -203,8 +175,8 @@ int libc_init(struct ezinj_ctx *ctx){
 	ez_addr libc_dlopen = sym_addr(h_libc, "__libc_dlopen_mode", libc);
 #elif defined(HAVE_DL_LOAD_SHARED_LIBRARY)
 	ez_addr ldso = {
-		.local = (uintptr_t)get_base(getpid(), "ld-uClibc"),
-		.remote = (uintptr_t)get_base(ctx->target, "ld-uClibc")
+		.local = (uintptr_t)get_base(getpid(), "ld-uClibc", NULL),
+		.remote = (uintptr_t)get_base(ctx->target, "ld-uClibc", NULL)
 	};
 	if(!ldso.local || !ldso.remote){
 		ERR("Failed to get ldso base");
@@ -225,8 +197,8 @@ int libc_init(struct ezinj_ctx *ctx){
 		}
 
 		ez_addr libdl = {
-			.local = (uintptr_t)get_base(getpid(), "libdl"),
-			.remote = (uintptr_t)get_base(ctx->target, "libdl")
+			.local = (uintptr_t)get_base(getpid(), "libdl", NULL),
+			.remote = (uintptr_t)get_base(ctx->target, "libdl", NULL)
 		};
 
 		DBGPTR(libdl.local);
@@ -393,15 +365,22 @@ struct ezinj_pl prepare_payload(void *mapped_mem, struct injcode_bearing *br){
 	return pl;
 }
 
-#define __RCALL(ctx, x, ...) remote_call(ctx->target, UPTR(x), __VA_ARGS__)
-#define __RCALL_SC(ctx, n, ...) __RCALL(ctx, ctx->syscall_insn.remote, n, __VA_ARGS__)
+#define __RCALL(ctx, insn, argmask, ...) remote_call(ctx->target, ctx->syscall_stack.remote, UPTR(insn), argmask, ##__VA_ARGS__)
+#define __RCALL_SC(ctx, nr, argmask, ...) __RCALL(ctx, ctx->syscall_insn.remote, argmask, nr, ##__VA_ARGS__)
+
+#define ARGMASK(x, i) (x | (1 << (i)))
+#define SC_0ARGS ARGMASK(0, 0)
+#define SC_1ARGS ARGMASK(SC_0ARGS, 1)
+#define SC_2ARGS ARGMASK(SC_1ARGS, 2)
+#define SC_3ARGS ARGMASK(SC_2ARGS, 3)
+#define SC_4ARGS ARGMASK(SC_3ARGS, 4)
 
 // Remote System Call
-#define RSCALL0(ctx,n)               __RCALL_SC(ctx,n,0,0,0,0)
-#define RSCALL1(ctx,n,a1)            __RCALL_SC(ctx,n,UPTR(a1),0,0,0)
-#define RSCALL2(ctx,n,a1,a2)         __RCALL_SC(ctx,n,UPTR(a1),UPTR(a2),0,0)
-#define RSCALL3(ctx,n,a1,a2,a3)      __RCALL_SC(ctx,n,UPTR(a1),UPTR(a2),UPTR(a3),0)
-#define RSCALL4(ctx,n,a1,a2,a3,a4)   __RCALL_SC(ctx,n,UPTR(a1),UPTR(a2),UPTR(a3),UPTR(a4))
+#define RSCALL0(ctx,nr)               __RCALL_SC(ctx,nr,SC_0ARGS)
+#define RSCALL1(ctx,nr,a1)            __RCALL_SC(ctx,nr,SC_1ARGS,UPTR(a1))
+#define RSCALL2(ctx,nr,a1,a2)         __RCALL_SC(ctx,nr,SC_2ARGS,UPTR(a1),UPTR(a2))
+#define RSCALL3(ctx,nr,a1,a2,a3)      __RCALL_SC(ctx,nr,SC_3ARGS,UPTR(a1),UPTR(a2),UPTR(a3))
+#define RSCALL4(ctx,nr,a1,a2,a3,a4)   __RCALL_SC(ctx,nr,SC_4ARGS,UPTR(a1),UPTR(a2),UPTR(a3),UPTR(a4))
 
 void cleanup_ipc(struct ezinj_ctx *ctx){
 	if(ctx->sem_id > -1){
@@ -429,33 +408,30 @@ int ezinject_main(
 ){
 	int shm_id, sem_id;
 
-	FILE *hmem = mem_open(ctx->target);
-	if(hmem == NULL){
-		PERROR("fopen");
-		return 1;
-	}
-
 	uintptr_t codeBase = get_code_base(ctx->target);
 	if(codeBase == 0){
 		ERR("Could not obtain code base");
 		return 1;
 	}
 
-	size_t dataLength = REGION_LENGTH(region_sc_insn);
+	size_t dataLength = ROUND_UP(
+		REGION_LENGTH(region_sc_insn),
+		sizeof(uintptr_t)
+	);
+	DBG("dataLength: %zu", dataLength);
 	uint8_t dataBak[dataLength];
-	{
-		if(fseek(hmem, codeBase, SEEK_SET) != 0){
-			PERROR("fseek (pre-read)");
-		} else if(fread(dataBak, 1, dataLength, hmem) != dataLength){
-			PERROR("fread");
-		} else if(fseek(hmem, codeBase, SEEK_SET) != 0){
-			PERROR("fseek (pre-write)");
-		} else if(fwrite((uint8_t *)region_sc_insn.start, 1, dataLength, hmem) != dataLength){
-			PERROR("fwrite");
+	{ //backup and replace ELF header
+		uintptr_t *pWordsIn = (uintptr_t *)&dataBak;
+		uintptr_t *pWordsOut = (uintptr_t *)region_sc_insn.start;
+		for(unsigned int i=0; i<dataLength; i+=sizeof(uintptr_t), pWordsIn++, pWordsOut++){
+			*pWordsIn = (uintptr_t)ptrace(PTRACE_PEEKTEXT, ctx->target, codeBase + i);
+			ptrace(PTRACE_POKETEXT, ctx->target, codeBase + i, *pWordsOut);
 		}
-		fflush(hmem);
-
 		ctx->syscall_insn.remote = codeBase;
+#ifdef EZ_ARCH_MIPS
+		// skip syscall instruction and apply stack offset (see note about sys_ipc)
+		ctx->syscall_stack.remote = codeBase + 4 - 16;
+#endif
 	}
 
 	/* Verify that remote_call works correctly */
@@ -513,7 +489,7 @@ int ezinject_main(
 #ifdef HAVE_SHM_SYSCALLS
 		int remote_shm_id = (int)CHECK(RSCALL3(ctx, __NR_shmget, ctx->target, MAPPINGSIZE, S_IRWXO));
 #else
-		int remote_shm_id = (int)CHECK(RSCALL4(ctx, __NR_ipc, SHMGET, ctx->target, MAPPINGSIZE, S_IRWXO));
+		int remote_shm_id = (int)CHECK(RSCALL4(ctx, __NR_ipc, IPCCALL(0, SHMGET), ctx->target, MAPPINGSIZE, S_IRWXO));
 #endif
 		if(remote_shm_id < 0){
 			ERR("Remote shmget failed: %d", remote_shm_id);
@@ -524,9 +500,27 @@ int ezinject_main(
 #ifdef HAVE_SHM_SYSCALLS
 		uintptr_t remote_shm_ptr = CHECK(RSCALL3(ctx, __NR_shmat, remote_shm_id, NULL, SHM_EXEC));
 #else
-		uintptr_t remote_shm_ptr = CHECK(RSCALL4(ctx, __NR_ipc, SHMAT, remote_shm_id, NULL, SHM_EXEC));
+
+		CHECK(RSCALL3(ctx, __NR_mprotect, codeBase, getpagesize(), PROT_READ | PROT_WRITE | PROT_EXEC));
+		/**
+		 * Calling convention for shmat in sys_ipc()
+		 * arg0 - IPCCALL(0, SHMAT)    specifies version 0 of the call format (1 is apparently "iBCS2 emulator")
+		 * arg1 - shmat: id
+		 * arg2 - shmat: flags
+		 * arg3 - pointer to memory that will hold the resulting shmaddr
+		 * arg4 [VIA STACK] - shmat: shmaddr (we want this to be 0 to let the kernel pick a free region)
+		 * 
+		 * Return: 0 on success, nonzero on error
+		 * Stack layout: arguments start from offset 16 on Mips O32
+		 * 
+		 * We pass shmaddr as arg3 aswell, so that 0 is used as shmaddr and is replaced with the new addr
+		 **/
+		CHECK(RSCALL4(ctx, __NR_ipc, IPCCALL(0, SHMAT), remote_shm_id, SHM_EXEC, codeBase + 4));
+		uintptr_t remote_shm_ptr = ptrace(PTRACE_PEEKTEXT, ctx->target, codeBase + 4);
+		DBGPTR(remote_shm_ptr);
+		CHECK(RSCALL3(ctx, __NR_mprotect, codeBase, getpagesize(), PROT_READ | PROT_EXEC));
 #endif
-		if(remote_shm_ptr == (uintptr_t)MAP_FAILED){
+		if(remote_shm_ptr == (uintptr_t)MAP_FAILED || remote_shm_ptr == 0){
 			ERR("Remote shmat failed: %p", (void *)remote_shm_ptr);
 			break;
 		}
@@ -543,9 +537,9 @@ int ezinject_main(
 		// stack base
 		uintptr_t *target_sp = (uintptr_t *)((uintptr_t)STACKALIGN(mapped_mem + MAPPINGSIZE - STACKSIZE));
 
-		// end of stack: used for arguments
+		// end of stack: used for arguments (add an extra for clone())
 		uintptr_t *stack_argv = (uintptr_t *)(
-			(uintptr_t)target_sp + STACKSIZE - sizeof(uintptr_t) * 3
+			(uintptr_t)target_sp + STACKSIZE - sizeof(uintptr_t) * 6
 		);
 
 		DBGPTR(target_sp);
@@ -561,21 +555,17 @@ int ezinject_main(
 		DBGPTR(stack_argv[1]);
 		DBGPTR(stack_argv[2]);
 
-		{
-			if(fseek(hmem, codeBase, SEEK_SET) != 0){
-				PERROR("fseek (restore pre-write)");
-			} else if(fwrite(dataBak, 1, dataLength, hmem) != dataLength){
-				PERROR("fwrite (restore)");
+		{ //restore ELF header
+			uintptr_t *pWordsOut = (uintptr_t *)&dataBak;
+			for(unsigned int i=0; i<dataLength; i+=sizeof(uintptr_t), pWordsOut++, pWordsOut++){
+				ptrace(PTRACE_POKETEXT, ctx->target, codeBase + i, *pWordsOut);
 			}
 		}
 
 		DBGPTR(remote_clone_entry);
-		pid_t tid = remote_call_stack(
-			ctx->target,
-			remote_clone_entry,
-			(uintptr_t)PL_REMOTE(stack_argv)
-		);
 
+		ctx->syscall_stack.remote = (uintptr_t)PL_REMOTE(stack_argv);
+		pid_t tid = __RCALL(ctx, remote_clone_entry, 0);
 		CHECK(tid);
 
 		err = 0;
@@ -585,7 +575,6 @@ int ezinject_main(
 		return err;
 	}
 
-	fclose(hmem);
 	ctx->sem_id = sem_id;
 	ctx->shm_id = shm_id;
 	ctx->mapped_mem = mapped_mem;

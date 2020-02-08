@@ -12,19 +12,14 @@
 #include "ezinject_arch.h"
 #include "ezinject_injcode.h"
 
-#define ALIGN(x) ((void *)(((uintptr_t)x + MEMALIGN) & ALIGNMSK))
-
-#ifdef HAVE_CLONE_IO
-#define CLONE_FLAGS (CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_PARENT|CLONE_THREAD|CLONE_IO)
-#else
-#define CLONE_FLAGS (CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_PARENT|CLONE_THREAD)
-#endif
+#define CLONE_FLAGS (CLONE_VM|CLONE_SIGHAND|CLONE_THREAD)
 
 #ifdef HAVE_LIBC_DLOPEN_MODE
 #define __RTLD_DLOPEN 0x80000000 /* glibc internal */
 #endif
 
 #define BR_STRTBL(br) ((char *)br + sizeof(*br) + (sizeof(char *) * br->argc))
+#define BR_USERDATA(br) ((char *)br + sizeof(*br) + br->dyn_size)
 
 #define EMIT_LABEL(name) \
 	asm volatile( \
@@ -56,14 +51,16 @@ void injected_clone(){
 	while(1);
 }
 
+#define INLINE static inline __attribute__((always_inline))
+
 #ifdef HAVE_DL_LOAD_SHARED_LIBRARY
-inline unsigned int strlen(const char *str){
+INLINE unsigned int strlen(const char *str){
 	unsigned int len = 0;
 	while(*(str++)) len++;
 	return len;
 }
 
-inline void *memset(void *s, int c, unsigned int n){
+INLINE void *memset(void *s, int c, unsigned int n){
     unsigned char* p=s;
     while(n--){
         *p++ = (unsigned char)c;
@@ -71,9 +68,9 @@ inline void *memset(void *s, int c, unsigned int n){
     return s;
 }
 
-int uclibc_dlopen(struct injcode_bearing *br){
+INLINE int uclibc_dlopen(struct injcode_bearing *br){
 	char *libdl_name = BR_STRTBL(br);
-	char *userlib_name = BR_STRTBL(br) + strlen(libdl_name) + 1;
+	char *userlib_name = libdl_name + strlen(libdl_name) + 1;
 
 	struct elf_resolve_hdr *tpnt;
 
@@ -91,11 +88,12 @@ int uclibc_dlopen(struct injcode_bearing *br){
 	br->uclibc_mips_got_reloc(tpnt, 0);
 #endif
 
-// FIXME: how do we get this dynamically? its offset is NOT fixed
-#define SYMBOL_SCOPE_OFFSET (15 * sizeof(void *))
-
+#ifndef UCLIBC_OLD
+#define GDB_SHARED_SIZE (5 * sizeof(void *))
+#define SYMBOL_SCOPE_OFFSET (10 * sizeof(void *))
 	struct r_scope_elem *global_scope = (struct r_scope_elem *)(
-		(uintptr_t)*(br->uclibc_loaded_modules) + SYMBOL_SCOPE_OFFSET
+		(uintptr_t)*(br->uclibc_loaded_modules) + GDB_SHARED_SIZE +
+		SYMBOL_SCOPE_OFFSET
 	);
 
 	struct r_scope_elem *ls = global_scope;
@@ -104,16 +102,22 @@ int uclibc_dlopen(struct injcode_bearing *br){
 	ls->next = (void *)(
 		(uintptr_t)tpnt + SYMBOL_SCOPE_OFFSET
 	);
+#endif
 
 	struct dyn_elf dyn;
 	memset(&dyn, 0x00, sizeof(dyn));
 	dyn.dyn = tpnt;
-	if(br->uclibc_dl_fixup(&dyn, global_scope, RTLD_NOW)){
-		// FIXME: we are not handling init/fini arrays
-		// This means the call will likely 'fail' and warn about unresolved symbols.
-		//
-		// symbol 'dl_cleanup': can't resolve symbol
-	}
+
+	/**
+	  * FIXME: we are not handling init/fini arrays
+ 	  * This means the call will likely warn about 'dl_cleanup' being unresolved, but it will work anyways.
+ 	  * -- symbol 'dl_cleanup': can't resolve symbol
+ 	  */
+#ifdef UCLIBC_OLD
+	br->uclibc_dl_fixup(&dyn, RTLD_NOW);
+#else
+	br->uclibc_dl_fixup(&dyn, global_scope, RTLD_NOW);
+#endif
 
 	void (*dlopen)(const char *filename, int flag) = (void *)(
 		((uintptr_t)(tpnt->loadaddr) + br->dlopen_offset)
@@ -126,6 +130,9 @@ int uclibc_dlopen(struct injcode_bearing *br){
 int clone_fn(void *arg){
 	struct injcode_bearing *br = (struct injcode_bearing *)arg;
 	
+	//EMIT_LABEL("loop");
+	//asm volatile("j loop\n");
+
 	int ret = 1;
 	if(br->actual_dlopen != NULL){
 		char *userlib_name = BR_STRTBL(br);
