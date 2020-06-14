@@ -52,6 +52,11 @@ if(NOT DL_LIBRARY)
 	message(FATAL_ERROR "libdl.so not found")
 endif()
 
+find_library(PTHREAD_LIBRARY "libpthread.so.0")
+if(NOT PTHREAD_LIBRARY)
+	message(FATAL_ERROR "libpthread.so not found")
+endif()
+
 check_library_exists("${DL_LIBRARY}" "dlopen" "" HAVE_DLOPEN)
 check_library_exists("${DL_LIBRARY}" "dlsym" "" HAVE_DLSYM)
 if(NOT HAVE_DLOPEN OR NOT HAVE_DLSYM)
@@ -65,6 +70,8 @@ find_library(DYN_LINKER "ld-uClibc.so.0")
 check_library_exists("${C_LIBRARY}" "__libc_dlopen_mode" "" HAVE_LIBC_DLOPEN_MODE)
 get_filename_component(C_LIBRARY_NAME "${C_LIBRARY}" NAME)
 
+get_filename_component(PTHREAD_LIBRARY_NAME "${PTHREAD_LIBRARY}" NAME)
+
 if(NOT HAVE_LIBC_DLOPEN_MODE)
 	if(NOT DYN_LINKER)
 		message(FATAL_ERROR "ld-uClibc.so.0 not found")
@@ -76,9 +83,6 @@ endif()
 if(NOT HAVE_LIBC_DLOPEN_MODE AND NOT HAVE_DL_LOAD_SHARED_LIBRARY)
 	message(FATAL_ERROR "Unsupported C library")
 endif()
-
-#find_library(C_LIBRARY "libc.so")
-#check_library_exists("${C_LIBRARY}" "__libc_dlopen_mode" "" HAVE_LIBC_DLOPEN_MODE)
 
 include(CheckSymbolExists)
 check_symbol_exists("__NR_shmget" "asm/unistd.h" HAVE_SHM_SYSCALLS)
@@ -111,35 +115,48 @@ configure_file(
 	${CMAKE_BINARY_DIR}/config.h
 )
 
-add_library(util
+add_executable(ezpatch
+	elfparse.c
+	ezpatch.c
 	util.c
 	elfparse.c
 )
 
-add_executable(ezpatch
-	elfparse.c
-	ezpatch.c
-)
-target_link_libraries(ezpatch util)
+function(add_ezinject_library target)
+	cmake_parse_arguments(LIB "USE_LH;USE_LOG" "" "SOURCES" ${ARGN})
 
-function(add_ezinject_library target sources)
-	list(APPEND sources ${CMAKE_SOURCE_DIR}/crt/crt.c)
+	set(sources "${LIB_SOURCES}")
+
+	list(APPEND sources
+		${CMAKE_SOURCE_DIR}/crt/crt.c
+		${CMAKE_SOURCE_DIR}/crt/crt_user.c
+	)
 	if(DEBUG)
 		list(APPEND sources ${CMAKE_SOURCE_DIR}/util.c)
 	endif()
 
+	set(moduledefs "MODULE_NAME=\"${target}\"")
+	if(LIB_USE_LOG)
+		list(APPEND moduledefs "LOG_USE_FILE")
+	endif()
+
+	foreach(source_file IN LISTS sources)
+		set_source_files_properties("${source_file}" PROPERTIES COMPILE_DEFINITIONS "${moduledefs}")
+	endforeach()
+
 	add_library(${target} SHARED ${sources})
 
-	target_link_libraries(${target}
-		lh_ifcpu
-		lh_sljitmod
-		lh_hook_linux
-	)
+	if(LIB_USE_LH)
+		target_link_libraries(${target}
+			lh_ifcpu
+			lh_sljitmod
+			lh_hook_linux
+		)
+	endif()
 endfunction()
 
 add_subdirectory(crt)
 add_subdirectory(samples)
-
 
 add_executable(ezinject
 	ezinject.c
@@ -149,8 +166,10 @@ add_executable(ezinject
 
 # -fno-toplevel-reorder: keep order of code as it was written
 # -fno-stack-protector: remove stack cookie checks
-# -fno-pic: remove calls to __x86_get_pc_thunk_ax (PIC
+# -fno-pic: remove calls to __x86_get_pc_thunk_ax
 # -nostdlib: this code doesn't use any library
-# -frame-pointer: don't save stack frames
-set_source_files_properties(ezinject_injcode.c PROPERTIES COMPILE_FLAGS "-fno-toplevel-reorder -fno-stack-protector -fno-pic -nostdlib -fomit-frame-pointer")
+# -fomit-frame-pointer: don't save stack frames
+# -ffreestanding: don't assume libc functions exist
+set_source_files_properties(ezinject_injcode.c PROPERTIES COMPILE_FLAGS "-fno-toplevel-reorder -fno-stack-protector -fno-pic -nostdlib -fomit-frame-pointer -Os -ffreestanding")
 target_link_libraries(ezinject dl lh_elf)
+
