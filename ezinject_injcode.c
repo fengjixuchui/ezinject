@@ -233,7 +233,7 @@ void injected_clone_proper(struct injcode_bearing *shm_br){
 		// just to make sure it's really loaded
 		void *h_libdl = dlopen(libdl_name, RTLD_NOLOAD);
 		if(h_libdl == NULL){
-			dlopen(libdl_name, RTLD_NOW);
+			dlopen(libdl_name, RTLD_NOW | RTLD_GLOBAL);
 		}
 
 		// acquire libpthread
@@ -241,7 +241,7 @@ void injected_clone_proper(struct injcode_bearing *shm_br){
 		{
 			had_pthread = dlopen(libpthread_name, RTLD_NOLOAD) != NULL;
 
-			h_pthread = dlopen(libpthread_name, RTLD_LAZY);
+			h_pthread = dlopen(libpthread_name, RTLD_LAZY | RTLD_GLOBAL);
 			if(!h_pthread){
 				DBG('!');
 				break;
@@ -268,23 +268,27 @@ void injected_clone_proper(struct injcode_bearing *shm_br){
 		DBG('w');
 		br_semop(br, sema, EZ_SEM_LIBCTL, 0);
 
+		void *result;
+
 		// wait for user thread to die
 		DBG('j');
-		pthread_join(br->user_tid, NULL);
+		pthread_join(br->user_tid, &result);
 
-		// cleanup
-		DBG('c');
-		{
-			/**
-			 * NOTE: uclibc old might trigger segfaults in the user library while doing this (sigh)
-			 **/
-			dlclose(br->userlib);
+		if((enum userlib_return_action)result != userlib_persist){
+			// cleanup
+			DBG('c');
+			{
+				/**
+				 * NOTE: uclibc old might trigger segfaults in the user library while doing this (sigh)
+				 **/
+				dlclose(br->userlib);
 
-			#ifndef UCLIBC_OLD
-			if(!had_pthread){
-				dlclose(h_pthread);
+				#ifndef UCLIBC_OLD
+				if(!had_pthread){
+					dlclose(h_pthread);
+				}
+				#endif
 			}
-			#endif
 		}
 
 		signal = SIGSTOP;
