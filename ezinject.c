@@ -28,6 +28,7 @@
 
 #include "util.h"
 #include "ezinject.h"
+#include "ezinject_common.h"
 #include "ezinject_arch.h"
 #include "ezinject_injcode.h"
 
@@ -350,10 +351,6 @@ int libc_init(struct ezinj_ctx *ctx){
 	DBGPTR(ctx->libc_##name.remote); \
 } while(0)
 
-#ifdef DEBUG
-	USE_LIBC_SYM(putchar);
-	USE_LIBC_SYM(puts);
-#endif
 	USE_LIBC_SYM(syscall);
 	USE_LIBC_SYM(semop);
 #undef USE_LIBC_SYM
@@ -362,8 +359,12 @@ int libc_init(struct ezinj_ctx *ctx){
 	return 0;
 }
 
-
 void strPush(char **strData, struct ezinj_str str){
+	// write the number of bytes we need to skip to get to the next string
+	*(unsigned int *)(*strData) = sizeof(unsigned int) + str.len;
+	*strData += sizeof(unsigned int);
+
+	// write the string itself
 	memcpy(*strData, str.str, str.len);
 	*strData += str.len;
 }
@@ -376,14 +377,14 @@ struct injcode_bearing *prepare_bearing(struct ezinj_ctx *ctx, int argc, char *a
 	int num_strings;
 
 	// argc + extras
-	num_strings = argc + 2;
+	num_strings = argc + 3;
 
 	struct ezinj_str args[num_strings];
 	int argi = 0;
 
 #define PUSH_STRING(str) do { \
 	args[argi] = ezstr_new(str); \
-	dyn_str_size += args[argi].len; \
+	dyn_str_size += args[argi].len + sizeof(unsigned int); \
 	argi++; \
 } while(0)
 
@@ -391,6 +392,8 @@ struct injcode_bearing *prepare_bearing(struct ezinj_ctx *ctx, int argc, char *a
 	PUSH_STRING(DL_LIBRARY_NAME);
 	// libpthread.so name (without path)
 	PUSH_STRING(PTHREAD_LIBRARY_NAME);
+
+	PUSH_STRING("pthread_join");
 
 	// library to load
 	char libName[PATH_MAX];
@@ -444,11 +447,6 @@ struct injcode_bearing *prepare_bearing(struct ezinj_ctx *ctx, int argc, char *a
 
 	USE_LIBC_SYM(dlopen);
 
-#ifdef DEBUG
-	USE_LIBC_SYM(putchar);
-	USE_LIBC_SYM(puts);
-#endif
-
 	USE_LIBC_SYM(syscall);
 	USE_LIBC_SYM(semop);
 
@@ -456,8 +454,6 @@ struct injcode_bearing *prepare_bearing(struct ezinj_ctx *ctx, int argc, char *a
 
 	br->argc = argc;
 	br->dyn_size = dyn_total_size;
-
-	strncpy(br->sym_pthread_join, "pthread_join", sizeof(br->sym_pthread_join));
 
 	char *stringData = (char *)br + sizeof(*br) + dyn_ptr_size;
 	for(int i=0; i<num_strings; i++){

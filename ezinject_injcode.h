@@ -10,6 +10,7 @@
 
 
 #include "config.h"
+#include "ezinject_common.h"
 
 #define EZ_SEM_LIBCTL 0
 
@@ -25,23 +26,6 @@
 		".globl "name"\n" \
 		name":\n" \
 	)
-
-
-#define UNUSED(x) (void)(x)
-#define UPTR(x) ((uintptr_t)(x))
-
-#define STRSZ(x) (strlen(x) + 1)
-#define ALIGNMSK(y) ((y)-1)
-#define ALIGN(x, y) ((void *)((UPTR(x) + ALIGNMSK(y)) & ~ALIGNMSK(y)))
-
-#define ROUND_UP(N, S) ((((N) + (S) - 1) / (S)) * (S))
-
-#define WORDALIGN(x) ALIGN(x, sizeof(void *))
-
-#define PAGEALIGN(x)  ALIGN(x, getpagesize())
-#define PTRADD(a, b) ( UPTR(a) + UPTR(b) )
-#define PTRDIFF(a, b) ( UPTR(a) - UPTR(b) )
-
 
 
 #define INLINE static inline __attribute__((always_inline))
@@ -101,9 +85,6 @@ struct injcode_bearing
 
 	void *userlib;
 
-	// => "pthread_join"
-	char sym_pthread_join[14];
-
 #if defined(HAVE_LIBC_DLOPEN_MODE)
 	void *(*libc_dlopen)(const char *name, int mode);
 #elif defined(HAVE_DL_LOAD_SHARED_LIBRARY)
@@ -127,10 +108,6 @@ struct injcode_bearing
 	void *libdl_handle;
 	long (*libc_syscall)(long number, ...);
 	int (*libc_semop)(int semid, struct sembuf *sops, size_t nsops);
-#ifdef DEBUG
-	int (*libc_puts)(const char *s);
-	int (*libc_putchar)(int c);
-#endif
 	int (*libc_snprintf)( char * s, size_t n, const char * format, ... );
 	int (*libc_putenv)(char *string);
 	struct injcode_user user;
