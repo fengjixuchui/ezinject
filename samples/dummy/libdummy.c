@@ -1,81 +1,161 @@
 #include <stdio.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <dlfcn.h>
 
-//#define LOG_USE_FILE
+#include "config.h"
 #include "log.h"
-#include "util.h"
 #include "interface/if_hook.h"
 #include "interface/cpu/if_sljit.h"
-#include "ezinject_injcode.h"
 
-#define UNUSED(x) (void)(x)
+#include "ezinject_util.h"
+#include "ezinject_injcode.h"
 
 LOG_SETUP(V_DBG);
 
-void installHooks(){
+// $TODO
+#ifndef EZ_TARGET_WINDOWS
+#define USE_SLJIT
+#define USE_LH
+#endif
+
+#ifdef USE_SLJIT
+/**
+ * Sample function that demonstrates the use of sljit
+ **/
+void *sljit_build_sample(void **ppCodeMem){
 	void *sljit_code = NULL;
-	struct sljit_compiler *compiler = NULL;
-
-	/* Uncomment to call the original */
-	/*
-	void (*f)(int, char*) = (void (*)(int a, char *b))original_test_function;
-	f(1, "test");
-	*/
-
-	void (*original_test_function) (int a, char *b);
-
-	void *self = dlopen(NULL, RTLD_NOW);
-	original_test_function = dlsym(self, "return1");
-
-	void *origCode = inj_backup_function(original_test_function, NULL, -1);
-	if(!origCode){
-		ERR("Cannot build the payload!");
-		return;
-	}
-
-	compiler = sljit_create_compiler(NULL);
+	struct sljit_compiler *compiler = sljit_create_compiler(NULL);
 	if(!compiler){
 		ERR("Unable to create sljit compiler instance");
-		return;
+		return NULL;
 	}
 
-	/*
-		Simple routine that returns 1337
-	*/
-	#if 0
-	sljit_emit_ijump(compiler, SLJIT_JUMP, SLJIT_IMM, (sljit_sw)origCode);
-	#else
+	/** Simple routine that returns 1337 **/
 	sljit_emit_enter(compiler, 0, 0, 0, 0, 0, 0, 0);
 	sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_RETURN_REG, 0, SLJIT_IMM, 1337);
 	sljit_emit_return(compiler, SLJIT_MOV, SLJIT_RETURN_REG, 1337);
-	#endif
 
-	sljit_code = sljit_generate_code(compiler) + compiler->executable_offset;
-	if(!sljit_code){
+	sljit_code = sljit_generate_code(compiler);
+	if(sljit_code == NULL){
 		ERR("Unable to build JIT Code");
+		return NULL;
 	}
+	if(ppCodeMem != NULL){
+		*ppCodeMem = sljit_code;
+	}
+	sljit_code += compiler->executable_offset;	
 
-	if(compiler)
+	if(compiler){
 		sljit_free_compiler(compiler);
+	}
 
 	INFO("JIT code");
 	hexdump(sljit_code, compiler->executable_size);
-	/* Set the code we just generated as the replacement */
-	INFO("Injecting to %p", original_test_function);
 
-	inj_replace_function(original_test_function, sljit_code);
+	return sljit_code;
 }
+#endif
+
+typedef int(*testFunc_t)(int arg1, int arg2);
+
+static testFunc_t pfnOrigTestFunc = NULL;
+static testFunc_t sljitCode = NULL;
+
+#ifdef UCLIBC_OLD
+int myCustomFn(int arg1, int arg2){
+	UNUSED(arg1);
+	UNUSED(arg2);
+	return 1338;
+}
+#else
+int myCustomFn(int arg1, int arg2){
+	DBG("original arguments: %d, %d", arg1, arg2);
+
+	#ifdef USE_SLJIT
+	// call the sljit code sample
+	arg1 = sljitCode(arg1, arg2);
+	#endif
+
+	arg2 = 0;
+
+	DBG("calling original(%d,%d)", arg1, arg2);
+	// call the original function
+	int origRet = pfnOrigTestFunc(arg1, arg2);
+
+	// modify original return
+	int newReturn = origRet * 10;
+	DBG("return: %d, give %d", origRet, newReturn);
+	return newReturn;
+}
+#endif
+
+#ifdef USE_LH
+void installHooks(){
+	void *self = dlopen(NULL, RTLD_LAZY);
+	if(self == NULL){
+		ERR("dlopen failed: %s", dlerror());
+		return;
+	}
+
+	void *codeMem = NULL;
+	int error = 1;
+
+	do {
+		testFunc_t pfnTestFunc = dlsym(self, "func1");
+		if(pfnTestFunc == NULL){
+			ERR("Couldn't locate test function: %s", dlerror());
+			break;
+		}
+
+		#ifdef USE_SLJIT
+		sljitCode = sljit_build_sample(&codeMem);
+		#endif
+
+		/**
+		 * create a trampoline to call the original function once the hook is installed
+		 * -1 enables automatic backup length detection (most relevant for arches with variable opcode size)
+		 **/
+		pfnOrigTestFunc = inj_backup_function(pfnTestFunc, NULL, -1);
+		if(!pfnOrigTestFunc){
+			ERR("Cannot build the payload!");
+			break;
+		}
+
+		testFunc_t pfnReplacement = myCustomFn;
+
+		// print the chain (original -> hook -> orig_trampoline)
+		INFO("%p -> %p -> %p", pfnTestFunc, pfnReplacement, pfnOrigTestFunc);
+
+		/**
+		 * overwrite the original function entry with a jump to the replacement
+		 **/
+		inj_replace_function(pfnTestFunc, pfnReplacement);
+		error = 0;
+	} while(0);
+
+	if(error){
+		INFO("failed to install hooks");
+		#ifdef USE_SLJIT
+		if(codeMem != NULL){
+			sljit_free_exec(codeMem);
+		}
+		#endif
+		dlclose(self);
+	} else {
+		INFO("hooks installed succesfully");
+	}
+}
+#endif
 
 int lib_preinit(struct injcode_user *user){
-	UNUSED(user);
-	// access user data
+	/**
+	 * this is needed for hooks pointing to code in this library
+	 * if we don't set this, dlclose() will be called and the hooks will segfault when called
+	 * (because they will then refer to unmapped memory)
+	 * this is *NOT* needed for code allocated elsewhere, e.g. on the heap (sljit)
+	 **/
+	user->persist = 1;
 	return 0;
-}
-
-void libdl_test(){
-	void *self = dlopen(NULL, RTLD_LAZY | RTLD_NOLOAD);
-	lprintf("self: %p\n", self);
 }
 
 int lib_main(int argc, char *argv[]){
@@ -83,7 +163,8 @@ int lib_main(int argc, char *argv[]){
 	for(int i=0; i<argc; i++){
 		lprintf("argv[%d] = %s\n", i, argv[i]);
 	}
-	libdl_test();
+	#ifdef USE_LH
 	installHooks();
-	return 0;
+	#endif
+return 0;
 }
